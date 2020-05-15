@@ -1,88 +1,6 @@
 // Gmail2GDrive
 // https://github.com/ahochsteger/gmail2gdrive
 
-// Modified by 
-// Max Prat-Carrabin
-// May 2020
-// https://github.com/maxsnet
-
-
-/**
- * Main function that processes Gmail attachments and stores them in Google Drive.
- * Use this as trigger function for periodic execution.
- */
-function Gmail2GDrive() {
-  if (!GmailApp) return; // Skip script execution if GMail is currently not available (yes this happens from time to time and triggers spam emails!)
- // var config = getGmail2GDriveConfig();
-  
-//Logger.log("Label Name." + config.processedLabel);
-//exit;
-  var label = getOrCreateLabel(config.processedLabel);
-  var end, start, runTime;
-  start = new Date(); // Start timer
-
-  // CacheService.getScriptCache().put("timezone", config.timezone);
-  CacheService.getScriptCache().put("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone);
-  config.timezone = CacheService.getScriptCache().get("timezone");
-  
-  Logger.log("Starting mail attachment processing.");
-  if (config.globalFilter===undefined) {
-    config.globalFilter = "has:attachment -in:trash -in:drafts -in:spam";
-  }
-
-  // Prepare the Google SpreadSheet log file
-  f_prepare_log_file_Int(config.logfilefolderpath);
-  
-  // Iterate over all rules:
-  for (var ruleIdx=0; ruleIdx<config.rules.length; ruleIdx++) {
-    var rule = config.rules[ruleIdx];
-    var gSearchExp  = config.globalFilter + " " + rule.filter + " -label:" + config.processedLabel;
-    if (config.newerThan != "") {
-      gSearchExp += " newer_than:" + config.newerThan;
-    }
-    var doArchive = rule.archive == true;
-    var doPDF = rule.saveThreadPDF == true;
-
-    // Process all threads matching the search expression:
-    var threads = GmailApp.search(gSearchExp);
-    Logger.log("  Processing rule: "+gSearchExp);
-    for (var threadIdx=0; threadIdx<threads.length; threadIdx++) {
-      var thread = threads[threadIdx];
-      end = new Date();
-      runTime = (end.getTime() - start.getTime())/1000;
-      Logger.log("    Processing thread: "+thread.getFirstMessageSubject() + " (runtime: " + runTime + "s/" + config.maxRuntime + "s)");
-      if (runTime >= config.maxRuntime) {
-        Logger.log("WARNING: Self terminating script after " + runTime + "s");
-        return;
-      }
-
-      // Process all messages of a thread:
-      var messages = thread.getMessages();
-      for (var msgIdx=0; msgIdx<messages.length; msgIdx++) {
-        var message = messages[msgIdx];
-        var message_isintrash = message.isInTrash();
-        // Logger.log("    Message in trash:" + message_isintrash );
-        if (  message_isintrash !== true ) { processMessage(message, rule, config); }        
-      }
-      if (doPDF) { // Generate a PDF document of a thread:
-        processThreadToPdf(thread, rule);
-      }
-
-      // Mark a thread as processed:
-      thread.addLabel(label);
-
-      if (doArchive) { // Archive a thread if required
-        Logger.log("    Archiving thread '" + thread.getFirstMessageSubject() + "' ...");
-        thread.moveToArchive();
-      }
-    }
-  }
-  end = new Date(); // Stop timer
-  runTime = (end.getTime() - start.getTime())/1000;
-  Logger.log("Finished mail attachment processing after " + runTime + "s");
-}
-
-
 /**
  * Returns the label with the given name or creates it if not existing.
  */
@@ -155,21 +73,20 @@ function getOrCreateFolder(folderName) {
 /**
  * Processes a message
  */
-// Process a message: extract attachement one by one,  upload it, rename it and add a description
 function processMessage(message, rule, config) {
-  Logger.log("      Processing message: "+message.getSubject() + " (" + message.getId() + ")");
+  Logger.log("INFO:       Processing message: "+message.getSubject() + " (" + message.getId() + ")");
   var messageDate = message.getDate();
   var attachments = message.getAttachments();
   for (var attIdx=0; attIdx<attachments.length; attIdx++) {
     var attachment = attachments[attIdx];
-    Logger.log("        Processing attachment: "+attachment.getName());
+    Logger.log("INFO:         Processing attachment: "+attachment.getName());
     var match = true;
     if (rule.filenameFromRegexp) {
     var re = new RegExp(rule.filenameFromRegexp);
       match = (attachment.getName()).match(re);
     }
     if (!match) {
-      Logger.log("          Rejecting file '" + attachment.getName() + " not matching" + rule.filenameFromRegexp);
+      Logger.log("INFO:           Rejecting file '" + attachment.getName() + " not matching" + rule.filenameFromRegexp);
       f_addaline_log_file_SpreadsheetApp(message.getSubject(),message.getDate(),message.getId(),"https://mail.google.com/mail/u/0/#inbox/" + message.getId(),"Attachment",attachment.getName(),"Rejected: not matching" + rule.filenameFromRegexp);
       continue;
     }
@@ -177,9 +94,16 @@ function processMessage(message, rule, config) {
       var folder = getOrCreateFolder(Utilities.formatDate(messageDate, config.timezone, rule.folder));
       var file = folder.createFile(attachment);
       var filename = file.getName();
-      
-      filename = NewFileName(message.getId(),filename, messageDate, rule.filenameTo,"file");
-
+      if (rule.filenameFrom && rule.filenameTo && rule.filenameFrom == file.getName()) {
+        filename = removeDiacritics(Utilities.formatDate(messageDate, config.timezone, rule.filenameTo.replace('%s',message.getSubject())));
+        Logger.log("INFO:           Renaming matched file '" + file.getName() + "' -> '" + filename + "'");
+        file.setName(filename);
+      }
+      else if (rule.filenameTo) {
+        filename = removeDiacritics(Utilities.formatDate(messageDate, config.timezone, rule.filenameTo.replace('%s',message.getSubject())));
+        Logger.log("INFO:           Renaming '" + file.getName() + "' -> '" + filename + "'");
+        file.setName(filename);
+      }
       file.setDescription("Mail title: " + message.getSubject() + "\nMail date: " + message.getDate() + "\nMail link: https://mail.google.com/mail/u/0/#inbox/" + message.getId());
       f_addaline_log_file_SpreadsheetApp(message.getSubject(),message.getDate(),message.getId(),"https://mail.google.com/mail/u/0/#inbox/" + message.getId(),"Attachment",file.getName(),file.getUrl());
       Utilities.sleep(config.sleepTime);
@@ -193,53 +117,112 @@ function processMessage(message, rule, config) {
  * Generate HTML code for one message of a thread.
  */
 function processThreadToHtml(thread) {
-  Logger.log("  Generating HTML code of thread '" + thread.getFirstMessageSubject() + "'");
+  Logger.log("INFO:   Generating HTML code of thread '" + thread.getFirstMessageSubject() + "'");
   var messages = thread.getMessages();
   var html = "";
   for (var msgIdx=0; msgIdx<messages.length; msgIdx++) {
     var message = messages[msgIdx];
-    var message_isintrash = message.isInTrash();
-    // Logger.log("    Message in trash:" + message_isintrash );
-        if ( message_isintrash !== true ) {
-          Logger.log("    Message not in trash: processing." );
-          html += "From: " + message.getFrom() + "<br />\n";
-          html += "To: " + message.getTo() + "<br />\n";
-          html += "Date: " + message.getDate() + "<br />\n";
-          html += "Subject: " + message.getSubject() + "<br />\n";
-          html += "<hr />\n";
-          html += message.getBody() + "\n";
-          html += "<hr />\n";
-         }        
-      }
+    html += "From: " + message.getFrom() + "<br />\n";
+    html += "To: " + message.getTo() + "<br />\n";
+    html += "Date: " + message.getDate() + "<br />\n";
+    html += "Subject: " + message.getSubject() + "<br />\n";
+    html += "<hr />\n";
+    html += message.getBody() + "\n";
+    html += "<hr />\n";
+  }
   return html;
 }
 
 /**
 * Generate a PDF document for the whole thread using HTML from .
  */
-function processThreadToPdf(thread, rule,config) {
-  Logger.log("Saving PDF copy of thread '" + thread.getFirstMessageSubject() + "'");
-  
-  var messages = thread.getMessages();
-  var message = messages[0];
-  var filename = NewFileName(message.getId(),message.getSubject(), message.getDate(), rule.filenameTo,"mail") + ".pdf";
-  
+function processThreadToPdf(thread, rule) {
+  Logger.log("INFO: Saving PDF copy of thread '" + thread.getFirstMessageSubject() + "'");
   rule.folder = rule.folder.replace(/\'/g,'');
   var folder = getOrCreateFolder(rule.folder);
-  
   var html = processThreadToHtml(thread);
   var blob = Utilities.newBlob(html, 'text/html');
-  var pdf = folder.createFile(blob.getAs('application/pdf')).setName(filename);
-  
+  var pdf = folder.createFile(blob.getAs('application/pdf')).setName(removeDiacritics(thread.getFirstMessageSubject()) + ".pdf");
   f_addaline_log_file_SpreadsheetApp(thread.getFirstMessageSubject(),thread.getLastMessageDate(),thread.getId(),"https://mail.google.com/mail/u/0/#inbox/" + thread.getId(),"Thread",pdf.getName(),pdf.getUrl());
+  return pdf;
+}
+
+/**
+ * Main function that processes Gmail attachments and stores them in Google Drive.
+ * Use this as trigger function for periodic execution.
+ */
+function Gmail2GDrive() {
+  if (!GmailApp) return; // Skip script execution if GMail is currently not available (yes this happens from time to time and triggers spam emails!)
+  var config = getGmail2GDriveConfig();
+  var label = getOrCreateLabel(config.processedLabel);
+  var end, start, runTime;
+  start = new Date(); // Start timer
+
+  Logger.log("INFO: Starting mail attachment processing.");
+  if (config.globalFilter===undefined) {
+    config.globalFilter = "has:attachment -in:trash -in:drafts -in:spam";
+  }
+
+  // Prepare the Google SpreadSheet log file
+  f_prepare_log_file_Int(config.logfilefolderpath);
   
-  return 1;
+  // Iterate over all rules:
+  for (var ruleIdx=0; ruleIdx<config.rules.length; ruleIdx++) {
+    var rule = config.rules[ruleIdx];
+    var gSearchExp  = config.globalFilter + " " + rule.filter + " -label:" + config.processedLabel;
+    if (config.newerThan != "") {
+      gSearchExp += " newer_than:" + config.newerThan;
+    }
+    var doArchive = rule.archive == true;
+    var doPDF = rule.saveThreadPDF == true;
+
+    // Process all threads matching the search expression:
+    var threads = GmailApp.search(gSearchExp);
+    Logger.log("INFO:   Processing rule: "+gSearchExp);
+    for (var threadIdx=0; threadIdx<threads.length; threadIdx++) {
+      var thread = threads[threadIdx];
+      end = new Date();
+      runTime = (end.getTime() - start.getTime())/1000;
+      Logger.log("INFO:     Processing thread: "+thread.getFirstMessageSubject() + " (runtime: " + runTime + "s/" + config.maxRuntime + "s)");
+      if (runTime >= config.maxRuntime) {
+        Logger.log("WARNING: Self terminating script after " + runTime + "s");
+        return;
+      }
+
+      // Process all messages of a thread:
+      var messages = thread.getMessages();
+      for (var msgIdx=0; msgIdx<messages.length; msgIdx++) {
+        var message = messages[msgIdx];
+        processMessage(message, rule, config);
+      }
+      if (doPDF) { // Generate a PDF document of a thread:
+        processThreadToPdf(thread, rule);
+      }
+
+      // Mark a thread as processed:
+      thread.addLabel(label);
+
+      if (doArchive) { // Archive a thread if required
+        Logger.log("INFO:     Archiving thread '" + thread.getFirstMessageSubject() + "' ...");
+        thread.moveToArchive();
+      }
+    }
+  }
+  end = new Date(); // Stop timer
+  runTime = (end.getTime() - start.getTime())/1000;
+  Logger.log("INFO: Finished mail attachment processing after " + runTime + "s");
 }
 
 
 // -----------------------------------------------------------------------------
 // START: Google SpreadSheet log gile functions.
 // -----------------------------------------------------------------------------
+// Max Prat-Carrabin
+// May 2020
+// https://github.com/maxsnet
+
+// Google Apps Script to add a Google Spreadsheet log file to the gmail2gdrive script (https://github.com/ahochsteger/gmail2gdrive),
+// Following issue https://github.com/ahochsteger/gmail2gdrive/issues/37
 
 // Naming conventions to functions and variables:
 // -- First part in lowercase is a human understandable name.
@@ -259,13 +242,13 @@ function f_prepare_log_file_Int(folder_path_String){
   var folder_DriveApp_Folder = f_folder_DriveApp_Folder(folder_id_String);
   var logfile_SpreadsheetApp_Spreadsheet = f_create_logfile_SpreadsheetApp_Spreadsheet(folder_DriveApp_Folder);
   var logfileId_String = logfile_SpreadsheetApp_Spreadsheet.getId()
-  Logger.log("logfile created - spreadsheet Id:" + logfileId_String);
+  Logger.log("INFO: logfile created - spreadsheet Id:" + logfileId_String);
   
   // Put the log file Spreasheet Id in Cache. After that, f_logfile_SpreadsheetApp_Spreadsheet can be called to retriev the Spreadheet log file.
   CacheService.getScriptCache().put("logfileId_String", logfileId_String);
   
-  // Logger.log("logfile spreadsheet Id cached:   " + CacheService.getScriptCache().get("logfileId_String"));
-  // Logger.log("logfile spreadsheet Id cached_f: " + f_logfile_SpreadsheetApp_Spreadsheet().getId());
+  // Logger.log("INFO: logfile spreadsheet Id cached:   " + CacheService.getScriptCache().get("logfileId_String"));
+  // Logger.log("INFO: logfile spreadsheet Id cached_f: " + f_logfile_SpreadsheetApp_Spreadsheet().getId());
   
   f_add_headers_log_file_Int();
 
@@ -306,12 +289,9 @@ function f_logfile_SpreadsheetApp_Spreadsheet(){
 // Then returns it, as SpreadsheetApp_Spreadsheet, by opening it.
 function f_create_logfile_SpreadsheetApp_Spreadsheet(folder_DriveApp_Folder) {
 
-  
-  var timezone = CacheService.getScriptCache().get("timezone");
-
   // -----------------------------------------------------------------------------
   // Prepare Log File Name ( log + date )
-  var logfname_String   = "log" + Utilities.formatDate(new Date(), timezone, "yyyyMMdd HH:mm:ss");
+  var logfname_String   = "log" + Utilities.formatDate(new Date(), "GMT", "yyyyMMdd HH:mm:ss");
   
   // -----------------------------------------------------------------------------
   // Create temporary Spreadsheet at the root of the Google Drive folder
@@ -319,7 +299,7 @@ function f_create_logfile_SpreadsheetApp_Spreadsheet(folder_DriveApp_Folder) {
   // https://developers.google.com/apps-script/reference/spreadsheet/spreadsheet
   var logfiletemp_SpreadsheetApp_Spreadsheet = SpreadsheetApp.create(logfname_String);
   
-  // Logger.log("temp logfile created -        Id:" + logfiletemp_SpreadsheetApp_Spreadsheet.getId());
+  // Logger.log("INFO: temp logfile created -        Id:" + logfiletemp_SpreadsheetApp_Spreadsheet.getId());
 
   // -----------------------------------------------------------------------------  
   // Get the SpreadsheetApp.Spreadsheet temporary log file as a DriveApp.File
@@ -335,7 +315,7 @@ function f_create_logfile_SpreadsheetApp_Spreadsheet(folder_DriveApp_Folder) {
   //var logfile_DriveApp_File = logfiletemp_DriveApp_File.makeCopy(logfname_String,DriveApp.getFolderById(folder_id_String));
   var logfile_DriveApp_File = logfiletemp_DriveApp_File.makeCopy(logfname_String,folder_DriveApp_Folder);
     
-  Logger.log("logfile created: " + logfile_DriveApp_File.getUrl());
+  Logger.log("INFO: logfile created: " + logfile_DriveApp_File.getUrl());
 
   // -----------------------------------------------------------------------------
   // Delete the temporary log file
@@ -343,7 +323,7 @@ function f_create_logfile_SpreadsheetApp_Spreadsheet(folder_DriveApp_Folder) {
   // child is a file
   // returns Folder
   DriveApp.removeFile(logfiletemp_DriveApp_File);
-  // Logger.log("temp logfile deleted.");
+  // Logger.log("INFO: temp logfile deleted.");
 
   return SpreadsheetApp.openById(logfile_DriveApp_File.getId());
   
@@ -428,41 +408,17 @@ function main(){
 
 
 // -----------------------------------------------------------------------------
-// START: function to improve filename.
+// START: Function to get rid of special characters in filename.
 // -----------------------------------------------------------------------------
 
-// -----------------------------------------------------------------------------
-// Returns a new filename using 'rule.filenameTo' from config.gs
-function NewFileName(id, name, date, filenameTo,type) {
-    
-  var timezone = CacheService.getScriptCache().get("timezone");
+// Max Prat-Carrabin
+// May 2020
+// https://github.com/maxsnet
 
-  // filename = Utilities.formatDate(date, config.timezone, rule.filenameTo.replace('%s',name));
-  
-  filename = Utilities.formatDate(date, timezone, filenameTo);
-  id = id.substr(id.length-3, 3);
-  filename = filename.replace('%id',id);  //email id
-  filename = filename.replace('%t',type); //type
-  filename = filename.replace('%s',name); //email topic
-  filename = filename.replace(rule.filenameReplaceFrom,rule.filenameReplaceTo); //user defined
-    
-  // filename = filename.replace('[toread] ','');  ==>> faire en REGEX.
-  filename = filename.substr(1, config.maxNameLength);
-  
-  if ( config.fnameComputerReady === true ) { 
-    filename = removeDiacritics(filename);
-    config.maxNameLength = Math.min(config.maxNameLength,"250");
-    filename = filename.substr(1, config.maxNameLength);
-  }
-    
-  Logger.log("Created a new  filename: " + filename);
-  return filename;
-}
-
-
-// -----------------------------------------------------------------------------
 // Source: https://stackoverflow.com/questions/30576304/parsing-special-characters-in-google-apps-script
+
 // usage : var userName = removeDiacritics(userNameWithIllegalCharacters);
+
 var defaultDiacriticsRemovalap = [
     {'base':'A', 'letters':'\u0041\u24B6\uFF21\u00C0\u00C1\u00C2\u1EA6\u1EA4\u1EAA\u1EA8\u00C3\u0100\u0102\u1EB0\u1EAE\u1EB4\u1EB2\u0226\u01E0\u00C4\u01DE\u1EA2\u00C5\u01FA\u01CD\u0200\u0202\u1EA0\u1EAC\u1EB6\u1E00\u0104\u023A\u2C6F'},
     {'base':'AA','letters':'\uA732'},
@@ -569,6 +525,5 @@ function removeDiacritics (str) {
 
 
 // -----------------------------------------------------------------------------
-// END: functions to improve filename.
+// END: Function to get rid of special characters in filename.
 // -----------------------------------------------------------------------------
-
